@@ -260,6 +260,7 @@ def get_trtllm_gen_prefill_module():
         enable_pdl: bool,
         workspace_size: int,
         window_left: int = -1,
+        is_causal: bool = True,
         out: Optional[torch.Tensor] = None,
         sinks: Optional[torch.Tensor] = None,
         key_block_scales: Optional[torch.Tensor] = None,
@@ -297,6 +298,7 @@ def get_trtllm_gen_prefill_module():
             cum_seq_lens_kv,
             sm_count,
             enable_pdl,
+            is_causal,
             workspace_size,
             sinks,
             key_block_scales,
@@ -705,6 +707,7 @@ def get_batch_prefill_module(backend, *args):
                 enable_pdl,
                 workspace_size,
                 window_left,
+                mask_mode != MaskMode.NON_CAUSAL.value,
                 out=o,
                 sinks=sinks,
                 key_block_scales=key_block_scales,
@@ -1990,12 +1993,12 @@ class BatchPrefillWithPagedKVCacheWrapper:
 
         self._block_tables = block_tables
         if self._backend == "trtllm-gen":
-            if not causal:
-                raise NotImplementedError(
-                    "Non-causal attention is not supported for trtllm-gen backend with paged KV cache. "
-                    "Please use causal=True or choose a different backend (e.g., fa2, fa3, cudnn)."
-                )
             assert logits_soft_cap == 0.0
+            if not causal and window_left >= 0:
+                raise NotImplementedError(
+                    "Sliding-window non-causal attention is not supported for trtllm-gen paged KV cache. "
+                    "Use window_left=-1 for dense bidirectional attention."
+                )
             if self._block_tables is None:
                 blocks_per_seq = [
                     (seq_len + page_size - 1) // page_size
@@ -3741,6 +3744,7 @@ def trtllm_batch_context_with_kv_cache(
     cum_seq_lens_q: torch.Tensor,
     cum_seq_lens_kv: torch.Tensor,
     window_left: int = -1,
+    causal: bool = True,
     out: Optional[Union[torch.Tensor, FP4Tensor]] = None,
     out_dtype: Optional[Union[torch.dtype, str]] = None,
     o_sf_scale: Optional[float] = None,
@@ -3796,6 +3800,9 @@ def trtllm_batch_context_with_kv_cache(
     window_left : int = -1
         The left (inclusive) window size for the attention window, when set to ``-1``, the window
         size will be set to the full length of the sequence. Defaults to ``-1``.
+    causal : bool = True
+        Whether to apply a causal mask. Set to ``False`` to request dense / bidirectional attention.
+        For the TRTLLM-gen paged context path, non-causal currently requires ``window_left == -1``.
     out : Optional[Union[torch.Tensor, FP4Tensor]] = None
         output tensor, if not provided, will be allocated with ``out_dtype``, if ``out_dtype`` is not provided, will use the type of ``query``.
     out_dtype : Optional[Union[torch.dtype, str]] = None
@@ -3856,6 +3863,11 @@ def trtllm_batch_context_with_kv_cache(
 
     if enable_pdl is None:
         enable_pdl = device_support_pdl(query.device)
+    if not causal and window_left >= 0:
+        raise NotImplementedError(
+            "Sliding-window non-causal attention is not supported for trtllm-gen paged KV cache. "
+            "Use window_left=-1 for dense bidirectional attention."
+        )
 
     if isinstance(kv_cache, tuple):
         k_cache, v_cache = kv_cache
@@ -4006,6 +4018,7 @@ def trtllm_batch_context_with_kv_cache(
         cum_seq_lens_kv,
         sm_count,
         enable_pdl,
+        causal,
         workspace_size,
         sinks,
         key_block_scales,
